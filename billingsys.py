@@ -1,0 +1,633 @@
+from ultralytics import YOLO
+import cv2
+from pydobot import Dobot
+import json
+import os
+import time
+import requests
+import RPi.GPIO as GPIO
+from gtts import gTTS
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+API_ADD_URL = "https://fruit-billing-api.onrender.com/add_item"
+API_STATUS_URL = "https://fruit-billing-api.onrender.com/status"
+
+API_TIMEOUT = 5
+SYNC_INTERVAL = 1.0
+
+CONVEYOR_PIN = 17
+IR_PIN = 27
+IR_ACTIVE_STATE = 0
+
+CAMERA_INDEX = "/dev/video0"
+MODEL_PATH = "runs/detect/train12/weights/best.pt"
+POSITIONS_FILE = "positions.json"
+DOBOT_PORT = "/dev/ttyACM0"
+
+DETECTION_CONFIDENCE = 0.5
+YOLO_IMAGE_SIZE = 320
+STABLE_FRAMES_REQUIRED = 5
+
+WINDOW_NAME = "Fruit Detection"
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup(CONVEYOR_PIN, GPIO.OUT)
+GPIO.setup(IR_PIN, GPIO.IN)
+
+fruit_counts = {
+    "Pear": 0,
+    "Strawberry": 0,
+    "Pineapple": 0,
+    "Orange": 0
+}
+
+drop_map = {
+    "pear": "pear_drop",
+    "strawberry": "strawberry_drop",
+    "pineapple": "pineapple_drop",
+    "orange": "orange_drop"
+}
+
+LABEL_MAP = {
+    "pear": "Pear",
+    "strawberry": "Strawberry",
+    "strawberries": "Strawberry",
+    "pineapple": "Pineapple",
+    "pine apple": "Pineapple",
+    "pine-apple": "Pineapple",
+    "orange": "Orange"
+}
+
+def normalize_label(label):
+    if label is None:
+        return None
+    label = str(label).strip().lower()
+    return LABEL_MAP.get(label, label.capitalize())
+
+def conveyor_on():
+    GPIO.output(CONVEYOR_PIN, GPIO.HIGH)
+    print("[CONVEYOR] ON")
+
+def conveyor_off():
+    GPIO.output(CONVEYOR_PIN, GPIO.LOW)
+    print("[CONVEYOR] OFF")
+
+def speak(text):
+    print("[VOICE]", text)
+    try:
+        tts = gTTS(text=text, lang="en")
+        tts.save("voice.mp3")
+        os.system("mpg123 -q voice.mp3")
+    except Exception as e:
+        print("[VOICE ERROR]", e)
+
+def update_local_counts_from_cart(cart):
+    for fruit in fruit_counts:
+        fruit_counts[fruit] = int(cart.get(fruit, cart.get(fruit.lower(), 0)))
+    print("[SYNC] Local camera counts:", fruit_counts)
+
+def sync_counts_from_backend():
+    try:
+        response = requests.get(API_STATUS_URL, timeout=API_TIMEOUT)
+        data = response.json()
+
+        if "cart" in data:
+            update_local_counts_from_cart(data["cart"])
+            return True
+
+        print("[SYNC WARNING] Backend response has no cart:", data)
+        return False
+
+    except Exception as e:
+        print("[SYNC ERROR]", e)
+        return False
+
+def send_to_api(fruit_name):
+    fruit_name = normalize_label(fruit_name)
+
+    if fruit_name not in fruit_counts:
+        print("[API ERROR] Unknown fruit:", fruit_name)
+        return False
+
+    try:
+        response = requests.post(
+            API_ADD_URL,
+            json={"fruit": fruit_name.lower()},
+            timeout=API_TIMEOUT
+        )
+
+        data = response.json()
+        print("[API RESPONSE]", data)
+
+        if "cart" in data:
+            update_local_counts_from_cart(data["cart"])
+
+        elif "fruit" in data and "count" in data:
+            updated_fruit = normalize_label(data["fruit"])
+            if updated_fruit in fruit_counts:
+                fruit_counts[updated_fruit] = int(data["count"])
+
+        else:
+            sync_counts_from_backend()
+
+        return True
+
+    except Exception as e:
+        print("[API ERROR]", e)
+        return False
+
+def draw_rounded_rect(img, x1, y1, x2, y2, color, radius=8, thickness=-1):
+    if thickness == -1:
+        cv2.rectangle(img, (x1 + radius, y1), (x2 - radius, y2), color, -1)
+        cv2.rectangle(img, (x1, y1 + radius), (x2, y2 - radius), color, -1)
+        cv2.circle(img, (x1 + radius, y1 + radius), radius, color, -1)
+        cv2.circle(img, (x2 - radius, y1 + radius), radius, color, -1)
+        cv2.circle(img, (x1 + radius, y2 - radius), radius, color, -1)
+        cv2.circle(img, (x2 - radius, y2 - radius), radius, color, -1)
+    else:
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+
+def put_clear_text(img, text, pos, size, color):
+    try:
+        pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_img)
+        font = ImageFont.truetype(FONT_PATH, size)
+
+        draw.text(
+            pos,
+            text,
+            font=font,
+            fill=(color[2], color[1], color[0])
+        )
+
+        img[:] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+    except Exception as e:
+        print("[FONT ERROR]", e)
+        cv2.putText(
+            img,
+            text,
+            pos,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA
+        )
+
+def draw_fruit_icon(frame, fruit, cx, cy):
+    fruit = normalize_label(fruit)
+
+    if fruit == "Pear":
+        cv2.circle(frame, (cx, cy + 5), 9, (40, 180, 40), -1, cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy - 6), 7, (60, 210, 60), -1, cv2.LINE_AA)
+        cv2.line(frame, (cx, cy - 14), (cx + 5, cy - 21), (35, 90, 20), 2, cv2.LINE_AA)
+        cv2.ellipse(frame, (cx + 8, cy - 20), (5, 3), -25, 0, 360, (30, 150, 30), -1, cv2.LINE_AA)
+
+    elif fruit == "Strawberry":
+        pts = np.array([
+            [cx, cy + 13],
+            [cx - 11, cy - 3],
+            [cx - 5, cy - 13],
+            [cx + 5, cy - 13],
+            [cx + 11, cy - 3]
+        ], np.int32)
+        cv2.fillPoly(frame, [pts], (30, 30, 220), lineType=cv2.LINE_AA)
+
+        leaf = np.array([
+            [cx - 8, cy - 13],
+            [cx - 4, cy - 19],
+            [cx, cy - 13],
+            [cx + 4, cy - 19],
+            [cx + 8, cy - 13]
+        ], np.int32)
+        cv2.fillPoly(frame, [leaf], (40, 160, 40), lineType=cv2.LINE_AA)
+
+        cv2.circle(frame, (cx - 4, cy), 1, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, (cx + 4, cy + 5), 1, (255, 255, 255), -1, cv2.LINE_AA)
+
+    elif fruit == "Pineapple":
+        cv2.ellipse(frame, (cx, cy + 4), (9, 13), 0, 0, 360, (0, 190, 230), -1, cv2.LINE_AA)
+        cv2.line(frame, (cx - 6, cy - 10), (cx - 10, cy - 20), (30, 150, 40), 2, cv2.LINE_AA)
+        cv2.line(frame, (cx, cy - 11), (cx, cy - 22), (30, 150, 40), 2, cv2.LINE_AA)
+        cv2.line(frame, (cx + 6, cy - 10), (cx + 10, cy - 20), (30, 150, 40), 2, cv2.LINE_AA)
+
+    elif fruit == "Orange":
+        cv2.circle(frame, (cx, cy), 12, (0, 125, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, (cx - 4, cy - 4), 3, (40, 170, 255), -1, cv2.LINE_AA)
+        cv2.line(frame, (cx, cy - 11), (cx + 5, cy - 19), (30, 140, 30), 2, cv2.LINE_AA)
+        cv2.ellipse(frame, (cx + 7, cy - 18), (5, 3), -25, 0, 360, (30, 170, 30), -1, cv2.LINE_AA)
+
+def draw_modern_ui(frame, counts):
+    panel_x = 12
+    panel_y = 12
+    panel_w = 245
+    panel_h = 205
+
+    shadow = frame.copy()
+
+    cv2.rectangle(
+        shadow,
+        (panel_x + 3, panel_y + 3),
+        (panel_x + panel_w + 3, panel_y + panel_h + 3),
+        (0, 0, 0),
+        -1
+    )
+
+    cv2.addWeighted(shadow, 0.10, frame, 0.90, 0, frame)
+
+    draw_rounded_rect(
+        frame,
+        panel_x,
+        panel_y,
+        panel_x + panel_w,
+        panel_y + panel_h,
+        (255, 255, 255),
+        8
+    )
+
+    draw_rounded_rect(
+        frame,
+        panel_x + 10,
+        panel_y + 10,
+        panel_x + 38,
+        panel_y + 38,
+        (210, 95, 0),
+        5
+    )
+
+    put_clear_text(frame, "|||", (panel_x + 17, panel_y + 13), 15, (255, 255, 255))
+    put_clear_text(frame, "Detected fruits", (panel_x + 48, panel_y + 13), 15, (10, 20, 45))
+
+    table_x = panel_x + 10
+    table_y = panel_y + 55
+    table_w = panel_w - 20
+    row_h = 34
+
+    rows = [
+        ("Pear", counts.get("Pear", 0)),
+        ("Strawberry", counts.get("Strawberry", 0)),
+        ("Pineapple", counts.get("Pineapple", 0)),
+        ("Orange", counts.get("Orange", 0)),
+    ]
+
+    for i, (fruit, count) in enumerate(rows):
+        ry = table_y + i * row_h
+
+        cv2.rectangle(
+            frame,
+            (table_x, ry),
+            (table_x + table_w, ry + row_h),
+            (255, 255, 255),
+            -1
+        )
+
+        cv2.rectangle(
+            frame,
+            (table_x, ry),
+            (table_x + table_w, ry + row_h),
+            (210, 215, 225),
+            1
+        )
+
+        cv2.line(
+            frame,
+            (table_x + 150, ry),
+            (table_x + 150, ry + row_h),
+            (210, 215, 225),
+            1
+        )
+
+        draw_fruit_icon(frame, fruit, table_x + 22, ry + 17)
+
+        put_clear_text(
+            frame,
+            fruit,
+            (table_x + 50, ry + 7),
+            14,
+            (0, 0, 0)
+        )
+
+        put_clear_text(
+            frame,
+            str(count),
+            (table_x + 175, ry + 7),
+            16,
+            (10, 20, 45)
+        )
+
+    return frame
+
+compressor_state = "UNKNOWN"
+
+def compressor_suck():
+    global compressor_state
+    device.grip(True)
+    compressor_state = "SUCK_OPEN"
+    print("[COMPRESSOR] SUCK / OPEN")
+
+def compressor_throw():
+    global compressor_state
+    device.grip(False)
+    compressor_state = "THROW_CLOSE"
+    print("[COMPRESSOR] THROW / CLOSE")
+
+def compressor_stop():
+    global compressor_state
+
+    try:
+        device.suck(False)
+        compressor_state = "STOP"
+        print("[COMPRESSOR] STOP")
+
+    except Exception as e:
+        compressor_state = "STOP_NOT_SUPPORTED"
+        print("[COMPRESSOR] STOP not supported by pydobot/device.suck(False)")
+        print("[COMPRESSOR] Keeping current state. Error:", e)
+
+def move_to_position(position_name):
+    if position_name not in positions:
+        print("[POSITION ERROR] Missing:", position_name)
+        return False
+
+    print("[MOVE]", position_name)
+    device.move_to(*positions[position_name], wait=True)
+    return True
+
+def execute_dobot_cycle(fruit_name):
+    fruit_name = normalize_label(fruit_name)
+    drop_key = drop_map.get(fruit_name.lower())
+
+    if not drop_key:
+        print("[DROP ERROR] No drop position for:", fruit_name)
+        return False
+
+    print("[DOBOT] START CYCLE:", fruit_name)
+
+    move_to_position("pick_safe")
+    time.sleep(0.3)
+
+    compressor_suck()
+    time.sleep(0.8)
+
+    move_to_position("pick")
+    time.sleep(0.3)
+
+    compressor_throw()
+    time.sleep(1.0)
+
+    move_to_position("pick_safe")
+    time.sleep(0.5)
+
+    move_to_position("drop_safe")
+    time.sleep(0.5)
+
+    move_to_position(drop_key)
+    time.sleep(1.0)
+
+    compressor_suck()
+    time.sleep(1.0)
+
+    move_to_position("drop_safe")
+    time.sleep(0.5)
+
+    compressor_stop()
+    time.sleep(0.5)
+
+    print("[DOBOT] CYCLE COMPLETE")
+    return True
+
+def save_position(name, display_name):
+    input(f"\nMove the robot to {display_name} and press ENTER...")
+
+    pose = device.pose()
+    x, y, z, r = pose[:4]
+
+    positions[name] = [x, y, z, r]
+
+    print(f"[SAVED] {display_name}")
+
+
+def teach_positions():
+    global positions
+
+    positions = {}
+
+    print("\n========== DOBOT CALIBRATION ==========\n")
+
+    save_position("pick", "Pick Position")
+    save_position("pick_safe", "Pick Safe Position")
+    save_position("drop_safe", "Drop Safe Position")
+    save_position("pear_drop", "Pear Drop Position")
+    save_position("strawberry_drop", "Strawberry Drop Position")
+    save_position("pineapple_drop", "Pineapple Drop Position")
+    save_position("orange_drop", "Orange Drop Position")
+
+    with open(POSITIONS_FILE, "w") as f:
+        json.dump(positions, f, indent=4)
+
+    print("\n[POSITIONS] All positions saved successfully.\n")
+
+def check_required_positions():
+    required_positions = [
+        "pick",
+        "pick_safe",
+        "drop_safe",
+        "pear_drop",
+        "strawberry_drop",
+        "pineapple_drop",
+        "orange_drop"
+    ]
+
+    missing = []
+
+    for pos in required_positions:
+        if pos not in positions:
+            missing.append(pos)
+
+    if missing:
+        print("[POSITION ERROR] Missing positions:", missing)
+        return False
+
+    return True
+
+conveyor_off()
+
+print("[DOBOT] Connecting...")
+device = Dobot(port=DOBOT_PORT)
+print("[DOBOT] Connected")
+
+compressor_stop()
+
+positions = {}
+
+reteach = input("Do you want to teach/reteach Dobot positions? (y/n): ").strip().lower()
+
+if reteach == "y" or not os.path.exists(POSITIONS_FILE):
+    teach_positions()
+
+with open(POSITIONS_FILE, "r") as f:
+    positions = json.load(f)
+
+print("[POSITIONS] Loaded")
+
+if not check_required_positions():
+    print("Please restart and reteach missing positions.")
+    GPIO.cleanup()
+    exit()
+
+print("[YOLO] Loading model...")
+model = YOLO(MODEL_PATH)
+print("[YOLO] Model loaded")
+
+cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
+
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+if not cap.isOpened():
+    print("[CAMERA ERROR] Camera not opened")
+    GPIO.cleanup()
+    exit()
+
+print("[CAMERA] Working")
+
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(WINDOW_NAME, 1024, 576)
+
+stable_label = None
+stable_count = 0
+
+robot_busy = False
+ir_triggered = False
+
+current_fruit = None
+last_sync_time = 0
+
+print("[SYSTEM] Syncing counts from backend...")
+sync_counts_from_backend()
+
+print("[SYSTEM] Started")
+
+try:
+    while True:
+        ret, frame = cap.read()
+
+        if not ret:
+            print("[CAMERA ERROR] Frame read failed")
+            continue
+
+        current_time = time.time()
+
+        if not robot_busy and current_time - last_sync_time >= SYNC_INTERVAL:
+            sync_counts_from_backend()
+            last_sync_time = current_time
+
+        if not robot_busy:
+            results = model(
+                frame,
+                conf=DETECTION_CONFIDENCE,
+                imgsz=YOLO_IMAGE_SIZE,
+                verbose=False
+            )
+
+            detected_label = None
+            best_confidence = 0.0
+
+            for r in results:
+                frame = r.plot()
+
+                for box in r.boxes:
+                    confidence = float(box.conf[0])
+
+                    if confidence > best_confidence:
+                        cls = int(box.cls[0])
+                        raw_label = model.names[cls]
+                        detected_label = normalize_label(raw_label)
+                        best_confidence = confidence
+
+            if detected_label == stable_label:
+                stable_count += 1
+            else:
+                stable_label = detected_label
+                stable_count = 1 if detected_label is not None else 0
+
+            if stable_count >= STABLE_FRAMES_REQUIRED and stable_label is not None:
+                if stable_label not in fruit_counts:
+                    print("[WARNING] Unknown fruit:", stable_label)
+                    stable_label = None
+                    stable_count = 0
+                else:
+                    current_fruit = stable_label
+
+                    print("[DETECTED]", current_fruit)
+
+                    robot_busy = True
+                    ir_triggered = False
+
+                    send_to_api(current_fruit)
+
+                    speak(f"This is {current_fruit}")
+
+                    print("[SYSTEM] Waiting for IR to be clear before conveyor ON...")
+
+                    while GPIO.input(IR_PIN) == IR_ACTIVE_STATE:
+                        time.sleep(0.1)
+
+                    conveyor_on()
+
+        if robot_busy and not ir_triggered:
+            if GPIO.input(IR_PIN) == IR_ACTIVE_STATE:
+                ir_triggered = True
+
+                print("[PROXIMITY] Fruit detected at pickup point")
+
+                conveyor_off()
+                time.sleep(0.2)
+
+                execute_dobot_cycle(current_fruit)
+
+                print("[SYSTEM] Waiting for IR sensor to clear...")
+
+                while GPIO.input(IR_PIN) == IR_ACTIVE_STATE:
+                    time.sleep(0.1)
+
+                print("[SYSTEM] IR cleared. Ready for next fruit.")
+
+                stable_label = None
+                stable_count = 0
+                robot_busy = False
+                ir_triggered = False
+                current_fruit = None
+
+        frame = draw_modern_ui(frame, fruit_counts)
+
+        cv2.imshow(WINDOW_NAME, frame)
+
+        if cv2.waitKey(1) == 27:
+            break
+
+except KeyboardInterrupt:
+    print("[SYSTEM] Stopped by user")
+
+finally:
+    conveyor_off()
+
+    try:
+        compressor_stop()
+    except Exception:
+        pass
+
+    cap.release()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
+
+    try:
+        device.close()
+    except Exception:
+        pass
+
+    print("[SYSTEM] Cleanup done")

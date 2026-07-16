@@ -1,0 +1,5 @@
+Ultralytics: 8.4.51
+Torch: 2.6.0+debian
+OpenCV: 4.13.0
+NumPy: 2.2.4
+PySerial: 3.4
